@@ -1,0 +1,514 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Global Helpers
+    // -------------------------------------------------------------------------
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidSku(sku) {
+      return sku is string && sku.size() >= 3 && sku.size() <= 32 && sku.matches('^[A-Z0-9_\\-]+$');
+    }
+
+    function isValidBatchNo(batchNo) {
+      return batchNo is string && batchNo.size() >= 3 && batchNo.size() <= 40 && batchNo.matches('^[A-Z0-9_\\-]+$');
+    }
+
+    function isValidHubId(hubId) {
+      return hubId is string && hubId.size() >= 2 && hubId.size() <= 64 && hubId.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidCategory(cat) {
+      return cat in [
+        'Antibiotics',
+        'Antidiabetics',
+        'Cardiovascular',
+        'Pediatrics & ORS',
+        'Cold-Chain Biologics',
+        'Analgesics & Antipyretics'
+      ];
+    }
+
+    function isValidUnit(unit) {
+      return unit in ['Strips', 'Vials', 'Bottles', 'Boxes', 'Sachets', 'Prefilled Syringes'];
+    }
+
+    function ownsWorkspace(workspaceId) {
+      return exists(/databases/$(database)/documents/workspaces/$(workspaceId)) &&
+        get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid;
+    }
+
+    function isAtomicTransferCreate(batchId, fromHubId, transferQty) {
+      return exists(/databases/$(database)/documents/inventoryBatches/$(batchId)) &&
+        get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.ownerId == request.auth.uid &&
+        get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.status == 'active' &&
+        get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.hubId == fromHubId &&
+        get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.quantity >= transferQty &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.ownerId == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.quantity ==
+          get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.quantity - transferQty &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.status ==
+          (getAfter(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.quantity == 0 ? 'depleted' : 'active');
+    }
+
+    function isAtomicTransferComplete(transferId, toHubId, transferQty) {
+      return transferId.size() <= 118 &&
+        existsAfter(/databases/$(database)/documents/inventoryBatches/$('batch_rcv_' + transferId)) &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$('batch_rcv_' + transferId)).data.ownerId == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$('batch_rcv_' + transferId)).data.hubId == toHubId &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$('batch_rcv_' + transferId)).data.quantity == transferQty &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$('batch_rcv_' + transferId)).data.status == 'active';
+    }
+
+    function isAtomicTransferCancel(batchId, transferQty) {
+      return exists(/databases/$(database)/documents/inventoryBatches/$(batchId)) &&
+        get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.ownerId == request.auth.uid &&
+        get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.status != 'quarantined' &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.quantity ==
+          get(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.quantity + transferQty &&
+        getAfter(/databases/$(database)/documents/inventoryBatches/$(batchId)).data.status == 'active';
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation Blueprints
+    // -------------------------------------------------------------------------
+    function isValidWorkspace(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'region', 'primaryHubId', 'seeded', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'name', 'region', 'primaryHubId', 'seeded', 'hubOverrides', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
+        data.region is string && data.region.size() >= 2 && data.region.size() <= 80 &&
+        isValidHubId(data.primaryHubId) &&
+        data.seeded is bool &&
+        (!('hubOverrides' in data) || (data.hubOverrides is map && data.hubOverrides.size() <= 20)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'workspaceId', 'role', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'workspaceId', 'role', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.uid == request.auth.uid &&
+        data.uid == userId &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        isValidId(data.workspaceId) &&
+        data.role in ['distributor_manager', 'inventory_analyst'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['ownerId', 'email', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'email', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidInventoryBatch(data) {
+      return data.keys().hasAll([
+          'ownerId', 'workspaceId', 'skuCode', 'medicineName', 'genericName',
+          'category', 'batchNumber', 'manufacturer', 'hubId', 'hubName',
+          'quantity', 'unit', 'reorderLevel', 'unitCostInr', 'mrpInr',
+          'expiryDate', 'storageCondition', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'workspaceId', 'skuCode', 'medicineName', 'genericName',
+          'category', 'batchNumber', 'manufacturer', 'hubId', 'hubName',
+          'quantity', 'unit', 'reorderLevel', 'unitCostInr', 'mrpInr',
+          'expiryDate', 'storageCondition', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        isValidId(data.workspaceId) &&
+        isValidSku(data.skuCode) &&
+        data.medicineName is string && data.medicineName.size() >= 2 && data.medicineName.size() <= 140 &&
+        data.genericName is string && data.genericName.size() >= 2 && data.genericName.size() <= 140 &&
+        isValidCategory(data.category) &&
+        isValidBatchNo(data.batchNumber) &&
+        data.manufacturer is string && data.manufacturer.size() >= 2 && data.manufacturer.size() <= 100 &&
+        isValidHubId(data.hubId) &&
+        data.hubName is string && data.hubName.size() >= 2 && data.hubName.size() <= 100 &&
+        data.quantity is int && data.quantity >= 0 && data.quantity <= 10000000 &&
+        isValidUnit(data.unit) &&
+        data.reorderLevel is int && data.reorderLevel >= 0 && data.reorderLevel <= 1000000 &&
+        (data.unitCostInr is int || data.unitCostInr is float) && data.unitCostInr > 0 && data.unitCostInr <= 1000000 &&
+        (data.mrpInr is int || data.mrpInr is float) && data.mrpInr > 0 && data.mrpInr <= 1000000 &&
+        data.expiryDate is string && data.expiryDate.size() == 10 && data.expiryDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.storageCondition in ['Ambient (15-25°C)', 'Cold Chain (2-8°C)', 'Cool Dry (<20°C)'] &&
+        data.status in ['active', 'quarantined', 'depleted'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSalesHistory(data) {
+      return data.keys().hasAll([
+          'ownerId', 'workspaceId', 'skuCode', 'medicineName', 'category',
+          'hubId', 'month', 'unitsSold', 'revenueInr', 'seasonalFactor',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'workspaceId', 'skuCode', 'medicineName', 'category',
+          'hubId', 'month', 'unitsSold', 'revenueInr', 'seasonalFactor',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        isValidId(data.workspaceId) &&
+        isValidSku(data.skuCode) &&
+        data.medicineName is string && data.medicineName.size() >= 2 && data.medicineName.size() <= 140 &&
+        isValidCategory(data.category) &&
+        isValidHubId(data.hubId) &&
+        data.month is string && data.month.size() == 7 && data.month.matches('^[0-9]{4}-[0-9]{2}$') &&
+        data.unitsSold is int && data.unitsSold >= 0 && data.unitsSold <= 10000000 &&
+        (data.revenueInr is int || data.revenueInr is float) && data.revenueInr >= 0 &&
+        (data.seasonalFactor is int || data.seasonalFactor is float) && data.seasonalFactor > 0 && data.seasonalFactor <= 5.0 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStockTransfer(data) {
+      return data.keys().hasAll([
+          'ownerId', 'workspaceId', 'batchId', 'skuCode', 'medicineName',
+          'batchNumber', 'fromHubId', 'fromHubName', 'toHubId', 'toHubName',
+          'quantity', 'unit', 'estimatedValueInr', 'transportMode', 'reason',
+          'status', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'workspaceId', 'batchId', 'skuCode', 'medicineName',
+          'batchNumber', 'fromHubId', 'fromHubName', 'toHubId', 'toHubName',
+          'quantity', 'unit', 'estimatedValueInr', 'transportMode', 'reason',
+          'status', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        isValidId(data.workspaceId) &&
+        isValidId(data.batchId) &&
+        isValidSku(data.skuCode) &&
+        data.medicineName is string && data.medicineName.size() >= 2 && data.medicineName.size() <= 140 &&
+        isValidBatchNo(data.batchNumber) &&
+        isValidHubId(data.fromHubId) &&
+        data.fromHubName is string && data.fromHubName.size() >= 2 && data.fromHubName.size() <= 100 &&
+        isValidHubId(data.toHubId) &&
+        data.toHubName is string && data.toHubName.size() >= 2 && data.toHubName.size() <= 100 &&
+        data.fromHubId != data.toHubId &&
+        data.quantity is int && data.quantity > 0 && data.quantity <= 10000000 &&
+        isValidUnit(data.unit) &&
+        (data.estimatedValueInr is int || data.estimatedValueInr is float) && data.estimatedValueInr >= 0 &&
+        data.transportMode in ['Cold-Chain Van', 'Express Highway Cargo', 'Hill-Route Insulated Carrier'] &&
+        data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 300 &&
+        data.status in ['pending', 'in_transit', 'completed', 'cancelled'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRecommendation(data) {
+      return data.keys().hasAll([
+          'ownerId', 'workspaceId', 'ruleId', 'priority', 'actionType',
+          'skuCode', 'medicineName', 'batchId', 'hubId', 'targetHubId',
+          'suggestedQty', 'estimatedImpactInr', 'rationale', 'status',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'workspaceId', 'ruleId', 'priority', 'actionType',
+          'skuCode', 'medicineName', 'batchId', 'hubId', 'targetHubId',
+          'suggestedQty', 'estimatedImpactInr', 'rationale', 'status',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        isValidId(data.workspaceId) &&
+        data.ruleId is string && data.ruleId.size() >= 3 && data.ruleId.size() <= 40 && data.ruleId.matches('^[A-Z0-9_\\-]+$') &&
+        data.priority in ['critical', 'warning', 'info'] &&
+        data.actionType in ['transfer', 'reorder', 'clearance', 'quarantine', 'buffer'] &&
+        isValidSku(data.skuCode) &&
+        data.medicineName is string && data.medicineName.size() >= 2 && data.medicineName.size() <= 140 &&
+        isValidId(data.batchId) &&
+        isValidHubId(data.hubId) &&
+        data.targetHubId is string && data.targetHubId.size() <= 64 &&
+        data.suggestedQty is int && data.suggestedQty >= 0 && data.suggestedQty <= 10000000 &&
+        (data.estimatedImpactInr is int || data.estimatedImpactInr is float) && data.estimatedImpactInr >= 0 &&
+        data.rationale is string && data.rationale.size() >= 5 && data.rationale.size() <= 400 &&
+        data.status in ['open', 'applied', 'dismissed'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStockMovement(data) {
+      return data.keys().hasAll([
+          'ownerId', 'workspaceId', 'movementType', 'skuCode', 'medicineName',
+          'batchId', 'batchNumber', 'hubId', 'hubName', 'targetHubId',
+          'targetHubName', 'quantityDelta', 'quantityAfter', 'unit', 'reason',
+          'actorUid', 'actorEmail', 'timestampIso', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'workspaceId', 'movementType', 'skuCode', 'medicineName',
+          'batchId', 'batchNumber', 'hubId', 'hubName', 'targetHubId',
+          'targetHubName', 'quantityDelta', 'quantityAfter', 'unit', 'reason',
+          'actorUid', 'actorEmail', 'timestampIso', 'createdAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        isValidId(data.workspaceId) &&
+        data.movementType in [
+          'batch_add', 'stock_adjust', 'quarantine', 'clearance',
+          'reorder_receive', 'transfer_out', 'transfer_in', 'transfer_cancel'
+        ] &&
+        isValidSku(data.skuCode) &&
+        data.medicineName is string && data.medicineName.size() >= 2 && data.medicineName.size() <= 140 &&
+        isValidId(data.batchId) &&
+        isValidBatchNo(data.batchNumber) &&
+        isValidHubId(data.hubId) &&
+        data.hubName is string && data.hubName.size() >= 2 && data.hubName.size() <= 100 &&
+        data.targetHubId is string && data.targetHubId.size() <= 64 &&
+        data.targetHubName is string && data.targetHubName.size() <= 100 &&
+        data.quantityDelta is int && data.quantityDelta >= -10000000 && data.quantityDelta <= 10000000 &&
+        data.quantityAfter is int && data.quantityAfter >= 0 && data.quantityAfter <= 10000000 &&
+        isValidUnit(data.unit) &&
+        data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 300 &&
+        isValidId(data.actorUid) &&
+        data.actorUid == request.auth.uid &&
+        data.actorEmail is string && data.actorEmail.size() <= 254 &&
+        data.timestampIso is string && data.timestampIso.size() >= 10 && data.timestampIso.size() <= 40 &&
+        data.createdAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+
+    match /workspaces/{workspaceId} {
+      allow get: if isSignedIn() && isValidId(workspaceId) && (
+        (resource == null && workspaceId == 'ws_' + request.auth.uid) ||
+        (resource != null && existing().ownerId == request.auth.uid)
+      );
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(workspaceId) &&
+        workspaceId == 'ws_' + request.auth.uid &&
+        isValidWorkspace(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(workspaceId) &&
+        isValidWorkspace(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['seeded', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['hubOverrides', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'primaryHubId', 'updatedAt'])
+        );
+      allow delete: if false;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && userId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        ownsWorkspace(incoming().workspaceId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        existing().uid == request.auth.uid &&
+        incoming().uid == existing().uid &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().role == existing().role &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']);
+      allow delete: if false;
+
+      match /private/{docId} {
+        allow get: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          userId == request.auth.uid &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+        allow create: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          userId == request.auth.uid &&
+          isValidUserPrivateInfo(incoming()) &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          userId == request.auth.uid &&
+          isValidUserPrivateInfo(incoming()) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt']);
+        allow delete: if false;
+      }
+    }
+
+    match /inventoryBatches/{batchId} {
+      allow get: if isSignedIn() && isValidId(batchId) && resource != null && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(batchId) &&
+        isValidInventoryBatch(incoming()) &&
+        ownsWorkspace(incoming().workspaceId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(batchId) &&
+        isValidInventoryBatch(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (existing().status != 'quarantined' &&
+            incoming().status in ['active', 'depleted'] &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['quantity', 'status', 'updatedAt'])) ||
+          (existing().status != 'quarantined' &&
+            incoming().status != 'quarantined' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['reorderLevel', 'hubId', 'hubName', 'storageCondition', 'status', 'updatedAt'])) ||
+          (existing().status == 'active' &&
+            incoming().status == 'quarantined' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isVerified() && isValidId(batchId) && resource != null && existing().ownerId == request.auth.uid;
+    }
+
+    match /salesHistory/{recordId} {
+      allow get: if isSignedIn() && isValidId(recordId) && resource != null && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(recordId) &&
+        isValidSalesHistory(incoming()) &&
+        ownsWorkspace(incoming().workspaceId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(recordId) &&
+        isValidSalesHistory(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['unitsSold', 'revenueInr', 'seasonalFactor', 'updatedAt']);
+      allow delete: if isVerified() && isValidId(recordId) && resource != null && existing().ownerId == request.auth.uid;
+    }
+
+    match /stockTransfers/{transferId} {
+      allow get: if isSignedIn() && isValidId(transferId) && resource != null && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(transferId) &&
+        isValidStockTransfer(incoming()) &&
+        incoming().status == 'pending' &&
+        ownsWorkspace(incoming().workspaceId) &&
+        isAtomicTransferCreate(incoming().batchId, incoming().fromHubId, incoming().quantity) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(transferId) &&
+        isValidStockTransfer(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        existing().status in ['pending', 'in_transit'] &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().batchId == existing().batchId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (existing().status == 'pending' &&
+            incoming().status == 'in_transit' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          (incoming().status == 'completed' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+            isAtomicTransferComplete(transferId, existing().toHubId, existing().quantity)) ||
+          (existing().status == 'pending' &&
+            incoming().status == 'cancelled' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+            isAtomicTransferCancel(existing().batchId, existing().quantity))
+        );
+      allow delete: if isVerified() && isValidId(transferId) && resource != null && existing().ownerId == request.auth.uid;
+    }
+
+    match /stockMovements/{movementId} {
+      allow get: if isSignedIn() && isValidId(movementId) && resource != null && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(movementId) &&
+        isValidStockMovement(incoming()) &&
+        ownsWorkspace(incoming().workspaceId) &&
+        incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /recommendations/{recId} {
+      allow get: if isSignedIn() && isValidId(recId) && (
+        (resource == null && request.auth.uid.size() >= 8 && recId.size() > 13 && recId[0:13] == 'rec_' + request.auth.uid[0:8] + '_') ||
+        (resource != null && existing().ownerId == request.auth.uid)
+      );
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(recId) &&
+        isValidRecommendation(incoming()) &&
+        incoming().status in ['open', 'applied', 'dismissed'] &&
+        ownsWorkspace(incoming().workspaceId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(recId) &&
+        isValidRecommendation(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        existing().status == 'open' &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().workspaceId == existing().workspaceId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (incoming().status == 'applied' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          (incoming().status == 'dismissed' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isVerified() && isValidId(recId) && resource != null && existing().ownerId == request.auth.uid;
+    }
+  }
+}

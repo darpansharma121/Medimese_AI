@@ -1,0 +1,8 @@
+{
+  "name": "MediFlow AI",
+  "description": "Pharmaceutical inventory, expiry management, and deterministic demand forecasting platform for Northeast India distributors.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
